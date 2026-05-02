@@ -1,0 +1,790 @@
+%% =========================================================================
+%  POST-STROKE GAIT ANALYSIS - 3D WALKING ANIMATION WITH KINEMATICS & GRF
+%  =========================================================================
+%  
+%  DATASET FOUND @ https://figshare.com/collections/A_full-body_motion_capture_gait_dataset_of_138_able-bodied_adults_across_the_life_span_and_50_stroke_survivors/6503791
+%
+%  PURPOSE:
+%  This script loads post-stroke gait data from a normalized dataset, 
+%  reconstructs 3D walking animation using forward kinematics, and estimates
+%  ground reaction forces (GRF) based on patient anthropometrics.
+%
+%  OUTPUTS:
+%  - Figure 1: Interactive 3D walking animation (rotatable with mouse)
+%  - Figure 2: X/Y/Z position and joint angles vs time
+%  - Figure 3: Ground reaction forces (Fz, Fx, Fy) vs time
+%  - Figure 4: Average GRF pattern over normalized gait cycle
+%
+%  COLOR CODING:
+%  - RED = Paretic (affected) side
+%  - BLUE = Non-paretic (unaffected) side
+%
+%  AVAILABLE SUBJECT CHARACTERISTICS (sub_char):
+%  - Weight (kg), Age, Male (1/0), Height (mm)
+%  - LegLength (mm), TPS, LesionLeft (1/0)
+%  - FAC, POMA, TIS
+%  
+%  =========================================================================
+
+clear; clc; close all;
+
+%% ======================= USER SETTINGS ==================================
+data_path = 'MAT_normalizedData_PostStrokeAdults_v27-02-23.mat';
+
+sID = 2;  % Subject ID (1-50) - CHANGE THIS FOR DIFFERENT SUBJECTS
+
+walkway_length = 12.0;  % meters
+trail_length = 40;       % frames of foot trail to show
+
+save_video = false;
+video_filename = sprintf('sID%d_walking_3D.mp4', sID);
+
+%% ======================= LOAD DATA ======================================
+fprintf('Loading data...\n');
+load(data_path);
+
+fprintf('Total subjects: %d, Selected: %d\n\n', length(Sub), sID);
+
+if sID > length(Sub)
+    error('Subject %d does not exist. Max is %d.', sID, length(Sub));
+end
+
+S = Sub(sID);
+P = S.PsideSegm_PsideData;
+N = S.NsideSegm_NsideData;
+
+%% ======================= PATIENT ANTHROPOMETRICS ========================
+% Extract actual patient characteristics from sub_char
+fprintf('========== PATIENT CHARACTERISTICS ==========\n');
+
+% Default values (fallbacks)
+patient_height = 1.70;   % m
+patient_mass = 70;       % kg
+leg_length = 0.85;       % m
+patient_age = NaN;
+is_male = NaN;
+lesion_left = NaN;
+FAC = NaN;
+POMA = NaN;
+TPS = NaN;
+
+if isfield(S, 'sub_char')
+    sc = S.sub_char;
+    
+    % Display all available characteristics
+    fprintf('Data from sub_char:\n');
+    
+    % Weight (kg)
+    if isfield(sc, 'Weight')
+        patient_mass = sc.Weight;
+        fprintf('  Weight:      %.1f kg\n', patient_mass);
+    end
+    
+    % Age
+    if isfield(sc, 'Age')
+        patient_age = sc.Age;
+        fprintf('  Age:         %d years\n', patient_age);
+    end
+    
+    % Sex
+    if isfield(sc, 'Male')
+        is_male = sc.Male;
+        if is_male == 1
+            fprintf('  Sex:         Male\n');
+        else
+            fprintf('  Sex:         Female\n');
+        end
+    end
+    
+    % Height (stored in mm, convert to m)
+    if isfield(sc, 'Height')
+        patient_height = sc.Height / 1000;  % mm to m
+        fprintf('  Height:      %.2f m (%.0f mm)\n', patient_height, sc.Height);
+    end
+    
+    % LEG LENGTH (stored in mm, convert to m) - KEY MEASUREMENT
+    if isfield(sc, 'LegLength')
+        leg_length = sc.LegLength / 1000;  % mm to m
+        fprintf('  Leg Length:  %.3f m (%.0f mm) <-- ACTUAL\n', leg_length, sc.LegLength);
+    end
+    
+    % Time Post Stroke
+    if isfield(sc, 'TPS')
+        TPS = sc.TPS;
+        fprintf('  TPS:         %d (time post-stroke)\n', TPS);
+    end
+    
+    % Lesion side
+    if isfield(sc, 'LesionLeft')
+        lesion_left = sc.LesionLeft;
+        if lesion_left == 1
+            fprintf('  Lesion:      Left hemisphere\n');
+        else
+            fprintf('  Lesion:      Right hemisphere\n');
+        end
+    end
+    
+    % Functional Ambulation Category (0-5)
+    if isfield(sc, 'FAC')
+        FAC = sc.FAC;
+        fprintf('  FAC:         %d (Functional Ambulation Category)\n', FAC);
+    end
+    
+    % Performance Oriented Mobility Assessment
+    if isfield(sc, 'POMA')
+        POMA = sc.POMA;
+        fprintf('  POMA:        %d (Performance Oriented Mobility Assessment)\n', POMA);
+    end
+    
+    % Trunk Impairment Scale
+    if isfield(sc, 'TIS')
+        TIS = sc.TIS;
+        fprintf('  TIS:         %d (Trunk Impairment Scale)\n', TIS);
+    end
+end
+
+fprintf('\n');
+
+% -------------------------------------------------------------------------
+% SEGMENT LENGTH CALCULATIONS
+% Use ACTUAL leg length from data, calculate segment proportions
+% Typical ratios: thigh ≈ 50% of leg, shank ≈ 50% of leg
+% -------------------------------------------------------------------------
+L_thigh = leg_length * 0.50;   % Thigh = ~50% of leg length
+L_shank = leg_length * 0.50;   % Shank = ~50% of leg length
+L_foot = 0.152 * patient_height;  % Foot length from height
+L_pelvis = 0.191 * patient_height; % Pelvis width from height
+
+fprintf('Segment lengths (calculated):\n');
+fprintf('  Thigh:       %.3f m\n', L_thigh);
+fprintf('  Shank:       %.3f m\n', L_shank);
+fprintf('  Foot:        %.3f m\n', L_foot);
+fprintf('  Pelvis:      %.3f m\n', L_pelvis);
+
+% -------------------------------------------------------------------------
+% SEGMENT MASSES (fractions of body mass from Winter 2009)
+% -------------------------------------------------------------------------
+mass_thigh = 0.100 * patient_mass;   % 10% per thigh
+mass_shank = 0.0465 * patient_mass;  % 4.65% per shank
+mass_foot = 0.0145 * patient_mass;   % 1.45% per foot
+mass_trunk = 0.497 * patient_mass;   % 49.7% for HAT
+
+body_weight = patient_mass * 9.81;   % N
+
+fprintf('\nBody weight: %.1f N\n', body_weight);
+fprintf('=============================================\n');
+
+%% ======================= EXTRACT JOINT ANGLES ===========================
+fprintf('\nExtracting joint angles...\n');
+
+    function out = extract_angle_data(data)
+        if isstruct(data)
+            fn = fieldnames(data);
+            if isfield(data, 'X')
+                out = data.X(:);
+            elseif isfield(data, 'x')
+                out = data.x(:);
+            elseif ~isempty(fn)
+                out = data.(fn{1})(:);
+            else
+                out = [];
+            end
+        elseif isnumeric(data)
+            out = data(:);
+        else
+            out = [];
+        end
+    end
+
+% Paretic side
+hip_flex_P_raw = extract_angle_data(P.HipAngles);
+knee_flex_P_raw = extract_angle_data(P.KneeAngles);
+ankle_flex_P_raw = extract_angle_data(P.AnkleAngles);
+
+% Non-paretic side
+hip_flex_N_raw = extract_angle_data(N.HipAngles);
+knee_flex_N_raw = extract_angle_data(N.KneeAngles);
+ankle_flex_N_raw = extract_angle_data(N.AnkleAngles);
+
+len_P = length(hip_flex_P_raw);
+len_N = length(hip_flex_N_raw);
+
+fprintf('Paretic samples: %d, Non-paretic samples: %d\n', len_P, len_N);
+
+%% ======================= NORMALIZE DATA LENGTH ==========================
+n_cycle = min(len_P, len_N);
+
+if len_P ~= n_cycle
+    x_old = linspace(0, 1, len_P);
+    x_new = linspace(0, 1, n_cycle);
+    hip_flex_P = interp1(x_old, hip_flex_P_raw, x_new, 'spline')';
+    knee_flex_P = interp1(x_old, knee_flex_P_raw, x_new, 'spline')';
+    ankle_flex_P = interp1(x_old, ankle_flex_P_raw, x_new, 'spline')';
+else
+    hip_flex_P = hip_flex_P_raw;
+    knee_flex_P = knee_flex_P_raw;
+    ankle_flex_P = ankle_flex_P_raw;
+end
+
+if len_N ~= n_cycle
+    x_old = linspace(0, 1, len_N);
+    x_new = linspace(0, 1, n_cycle);
+    hip_flex_N = interp1(x_old, hip_flex_N_raw, x_new, 'spline')';
+    knee_flex_N = interp1(x_old, knee_flex_N_raw, x_new, 'spline')';
+    ankle_flex_N = interp1(x_old, ankle_flex_N_raw, x_new, 'spline')';
+else
+    hip_flex_N = hip_flex_N_raw;
+    knee_flex_N = knee_flex_N_raw;
+    ankle_flex_N = ankle_flex_N_raw;
+end
+
+hip_flex_P = fillmissing(hip_flex_P(:), 'linear');
+hip_flex_N = fillmissing(hip_flex_N(:), 'linear');
+knee_flex_P = fillmissing(knee_flex_P(:), 'linear');
+knee_flex_N = fillmissing(knee_flex_N(:), 'linear');
+ankle_flex_P = fillmissing(ankle_flex_P(:), 'linear');
+ankle_flex_N = fillmissing(ankle_flex_N(:), 'linear');
+
+fprintf('Normalized to %d samples per cycle\n', n_cycle);
+
+%% ======================= GAIT PARAMETERS ================================
+fprintf('\n========== GAIT PARAMETERS ==========\n');
+
+hip_ROM_P = max(hip_flex_P) - min(hip_flex_P);
+hip_ROM_N = max(hip_flex_N) - min(hip_flex_N);
+
+fprintf('Hip ROM - Paretic: %.1f°, Non-Paretic: %.1f°\n', hip_ROM_P, hip_ROM_N);
+
+% Step length from actual leg length
+step_length_P = leg_length * (sind(max(hip_flex_P)) + sind(abs(min(hip_flex_P))));
+step_length_N = leg_length * (sind(max(hip_flex_N)) + sind(abs(min(hip_flex_N))));
+
+stride_length = step_length_P + step_length_N;
+stride_length = max(0.4, min(1.8, stride_length));
+
+cadence = 90;  % steps/min (typical post-stroke)
+walking_speed = stride_length * (cadence / 60) / 2;
+walking_speed = max(0.2, min(1.5, walking_speed));
+
+asymmetry = abs(step_length_P - step_length_N) / ((step_length_P + step_length_N)/2) * 100;
+
+fprintf('Step length - Paretic: %.3f m, Non-Paretic: %.3f m\n', step_length_P, step_length_N);
+fprintf('Stride length: %.3f m\n', stride_length);
+fprintf('Walking speed: %.2f m/s\n', walking_speed);
+fprintf('Asymmetry: %.1f%%\n', asymmetry);
+fprintf('=====================================\n');
+
+%% ======================= CREATE CONTINUOUS WALKING ======================
+n_strides = ceil(walkway_length / stride_length);
+total_time = walkway_length / walking_speed;
+dt = total_time / (n_strides * n_cycle);
+n_total = n_strides * n_cycle;
+g = 9.81;
+
+fprintf('\nSimulation: %d strides, %d frames, %.1f s\n', n_strides, n_total, total_time);
+
+hip_P_full = repmat(hip_flex_P, n_strides, 1);
+hip_N_full = repmat(hip_flex_N, n_strides, 1);
+knee_P_full = repmat(knee_flex_P, n_strides, 1);
+knee_N_full = repmat(knee_flex_N, n_strides, 1);
+ankle_P_full = repmat(ankle_flex_P, n_strides, 1);
+ankle_N_full = repmat(ankle_flex_N, n_strides, 1);
+
+% 50% phase shift
+shift = round(n_cycle / 2);
+hip_N_full = circshift(hip_N_full, shift);
+knee_N_full = circshift(knee_N_full, shift);
+ankle_N_full = circshift(ankle_N_full, shift);
+
+t = linspace(0, total_time, n_total)';
+
+%% ======================= FORWARD KINEMATICS =============================
+fprintf('Computing kinematics...\n');
+
+pelvis_height = leg_length;  % Use actual leg length for pelvis height
+
+pelvis_pos = zeros(n_total, 3);
+hip_P_pos = zeros(n_total, 3);
+hip_N_pos = zeros(n_total, 3);
+knee_P_pos = zeros(n_total, 3);
+knee_N_pos = zeros(n_total, 3);
+ankle_P_pos = zeros(n_total, 3);
+ankle_N_pos = zeros(n_total, 3);
+toe_P_pos = zeros(n_total, 3);
+toe_N_pos = zeros(n_total, 3);
+CoM_pos = zeros(n_total, 3);
+
+for i = 1:n_total
+    x = walking_speed * t(i);
+    phase = mod(i-1, n_cycle) / n_cycle;
+    z_bob = 0.012 * sin(2 * pi * phase);
+    y_sway = 0.015 * sin(2 * pi * phase);
+    
+    pelvis_pos(i,:) = [x, y_sway, pelvis_height + z_bob];
+    hip_P_pos(i,:) = pelvis_pos(i,:) + [0, L_pelvis/2, 0];
+    hip_N_pos(i,:) = pelvis_pos(i,:) + [0, -L_pelvis/2, 0];
+    
+    % Paretic leg
+    hf = deg2rad(hip_P_full(i));
+    kf = deg2rad(abs(knee_P_full(i)));
+    af = deg2rad(ankle_P_full(i));
+    
+    thigh = L_thigh * [sin(hf), 0, -cos(hf)];
+    knee_P_pos(i,:) = hip_P_pos(i,:) + thigh;
+    
+    shank_ang = hf - kf;
+    shank = L_shank * [sin(shank_ang), 0, -cos(shank_ang)];
+    ankle_P_pos(i,:) = knee_P_pos(i,:) + shank;
+    
+    foot_ang = shank_ang + af - pi/2;
+    toe_P_pos(i,:) = ankle_P_pos(i,:) + L_foot * 0.7 * [cos(foot_ang), 0, sin(foot_ang)];
+    
+    % Non-paretic leg
+    hf = deg2rad(hip_N_full(i));
+    kf = deg2rad(abs(knee_N_full(i)));
+    af = deg2rad(ankle_N_full(i));
+    
+    thigh = L_thigh * [sin(hf), 0, -cos(hf)];
+    knee_N_pos(i,:) = hip_N_pos(i,:) + thigh;
+    
+    shank_ang = hf - kf;
+    shank = L_shank * [sin(shank_ang), 0, -cos(shank_ang)];
+    ankle_N_pos(i,:) = knee_N_pos(i,:) + shank;
+    
+    foot_ang = shank_ang + af - pi/2;
+    toe_N_pos(i,:) = ankle_N_pos(i,:) + L_foot * 0.7 * [cos(foot_ang), 0, sin(foot_ang)];
+    
+    % CoM
+    trunk_CoM = pelvis_pos(i,:) + [0, 0, 0.3 * 0.3 * patient_height];
+    thigh_P_CoM = (hip_P_pos(i,:) + knee_P_pos(i,:)) / 2;
+    shank_P_CoM = (knee_P_pos(i,:) + ankle_P_pos(i,:)) / 2;
+    thigh_N_CoM = (hip_N_pos(i,:) + knee_N_pos(i,:)) / 2;
+    shank_N_CoM = (knee_N_pos(i,:) + ankle_N_pos(i,:)) / 2;
+    
+    CoM_pos(i,:) = (mass_trunk * trunk_CoM + ...
+                    mass_thigh * thigh_P_CoM + mass_shank * shank_P_CoM + ...
+                    mass_thigh * thigh_N_CoM + mass_shank * shank_N_CoM) / ...
+                   (mass_trunk + 2*mass_thigh + 2*mass_shank);
+end
+
+% Ground correction
+min_z = min([ankle_P_pos(:,3); ankle_N_pos(:,3); toe_P_pos(:,3); toe_N_pos(:,3)]);
+offset = -min_z + 0.005;
+
+pelvis_pos(:,3) = pelvis_pos(:,3) + offset;
+hip_P_pos(:,3) = hip_P_pos(:,3) + offset;
+hip_N_pos(:,3) = hip_N_pos(:,3) + offset;
+knee_P_pos(:,3) = knee_P_pos(:,3) + offset;
+knee_N_pos(:,3) = knee_N_pos(:,3) + offset;
+ankle_P_pos(:,3) = ankle_P_pos(:,3) + offset;
+ankle_N_pos(:,3) = ankle_N_pos(:,3) + offset;
+toe_P_pos(:,3) = toe_P_pos(:,3) + offset;
+toe_N_pos(:,3) = toe_N_pos(:,3) + offset;
+CoM_pos(:,3) = CoM_pos(:,3) + offset;
+
+%% ======================= GAIT PHASE DETECTION ===========================
+fprintf('\n========== GAIT PHASE DETECTION ==========\n');
+
+stance_P = false(n_total, 1);
+stance_N = false(n_total, 1);
+
+for i = 1:n_total
+    phase_P = mod((i-1), n_cycle) / n_cycle;
+    phase_N = mod((i-1) + shift, n_cycle) / n_cycle;
+    
+    stance_P(i) = phase_P < 0.60;
+    stance_N(i) = phase_N < 0.60;
+end
+
+clearance_P = min(ankle_P_pos(:,3), toe_P_pos(:,3));
+clearance_N = min(ankle_N_pos(:,3), toe_N_pos(:,3));
+
+fprintf('Paretic stance: %.1f%% of gait\n', 100*sum(stance_P)/n_total);
+fprintf('Non-paretic stance: %.1f%% of gait\n', 100*sum(stance_N)/n_total);
+fprintf('Double support: %.1f%%\n', 100*sum(stance_P & stance_N)/n_total);
+fprintf('==========================================\n');
+
+%% ======================= GROUND REACTION FORCE ==========================
+fprintf('Computing Ground Reaction Forces...\n');
+
+CoM_vel = zeros(n_total, 3);
+CoM_acc = zeros(n_total, 3);
+
+for i = 2:n_total-1
+    CoM_vel(i,:) = (CoM_pos(i+1,:) - CoM_pos(i-1,:)) / (2*dt);
+    CoM_acc(i,:) = (CoM_pos(i+1,:) - 2*CoM_pos(i,:) + CoM_pos(i-1,:)) / (dt^2);
+end
+CoM_vel(1,:) = CoM_vel(2,:);
+CoM_vel(end,:) = CoM_vel(end-1,:);
+CoM_acc(1,:) = CoM_acc(2,:);
+CoM_acc(end,:) = CoM_acc(end-1,:);
+
+window = max(3, round(n_cycle / 20));
+CoM_acc = movmean(CoM_acc, window);
+
+GRF_P = zeros(n_total, 3);
+GRF_N = zeros(n_total, 3);
+
+for i = 1:n_total
+    Fz_total = patient_mass * (g + CoM_acc(i,3));
+    Fz_total = max(0, Fz_total);
+    
+    phase_P = mod((i-1), n_cycle) / n_cycle;
+    
+    if stance_P(i) && stance_N(i)
+        if phase_P < 0.10
+            ratio_P = 0.2 + 0.6 * (phase_P / 0.10);
+        elseif phase_P > 0.50 && phase_P < 0.60
+            ratio_P = 0.8 - 0.6 * ((phase_P - 0.50) / 0.10);
+        else
+            ratio_P = 0.5;
+        end
+        
+        asym_adj = 1 - (asymmetry / 300);
+        ratio_P = ratio_P * asym_adj;
+        ratio_P = max(0.2, min(0.8, ratio_P));
+        
+        GRF_P(i,3) = Fz_total * ratio_P;
+        GRF_N(i,3) = Fz_total * (1 - ratio_P);
+        
+    elseif stance_P(i)
+        GRF_P(i,3) = Fz_total;
+        GRF_N(i,3) = 0;
+        
+    elseif stance_N(i)
+        GRF_P(i,3) = 0;
+        GRF_N(i,3) = Fz_total;
+    end
+    
+    if stance_P(i)
+        GRF_P(i,1) = patient_mass * CoM_acc(i,1) * 0.4 * (GRF_P(i,3) / max(1, Fz_total));
+        GRF_P(i,2) = patient_mass * CoM_acc(i,2) * 0.2 * (GRF_P(i,3) / max(1, Fz_total));
+    end
+    if stance_N(i)
+        GRF_N(i,1) = patient_mass * CoM_acc(i,1) * 0.4 * (GRF_N(i,3) / max(1, Fz_total));
+        GRF_N(i,2) = patient_mass * CoM_acc(i,2) * 0.2 * (GRF_N(i,3) / max(1, Fz_total));
+    end
+end
+
+% GRF waveform modulation
+for i = 1:n_total
+    phase_P = mod((i-1), n_cycle) / n_cycle;
+    phase_N = mod((i-1) + shift, n_cycle) / n_cycle;
+    
+    if stance_P(i)
+        stance_pct = phase_P / 0.60;
+        if stance_pct < 0.15
+            peak_mod = 1.0 + 0.15 * sin(pi * stance_pct / 0.15);
+        elseif stance_pct > 0.80
+            peak_mod = 1.0 + 0.10 * sin(pi * (stance_pct - 0.80) / 0.20);
+        elseif stance_pct > 0.35 && stance_pct < 0.50
+            peak_mod = 0.90;
+        else
+            peak_mod = 1.0;
+        end
+        GRF_P(i,3) = GRF_P(i,3) * peak_mod;
+    end
+    
+    if stance_N(i)
+        stance_pct = phase_N / 0.60;
+        if stance_pct < 0.15
+            peak_mod = 1.0 + 0.18 * sin(pi * stance_pct / 0.15);
+        elseif stance_pct > 0.80
+            peak_mod = 1.0 + 0.15 * sin(pi * (stance_pct - 0.80) / 0.20);
+        elseif stance_pct > 0.35 && stance_pct < 0.50
+            peak_mod = 0.92;
+        else
+            peak_mod = 1.0;
+        end
+        GRF_N(i,3) = GRF_N(i,3) * peak_mod;
+    end
+end
+
+GRF_P = movmean(GRF_P, max(1, round(window/2)));
+GRF_N = movmean(GRF_N, max(1, round(window/2)));
+
+GRF_P_BW = GRF_P / body_weight;
+GRF_N_BW = GRF_N / body_weight;
+
+fprintf('Peak GRF Paretic: %.2f BW (%.1f N)\n', max(GRF_P_BW(:,3)), max(GRF_P(:,3)));
+fprintf('Peak GRF Non-Paretic: %.2f BW (%.1f N)\n', max(GRF_N_BW(:,3)), max(GRF_N(:,3)));
+
+%% ======================= FIGURE 1: 3D ANIMATION =========================
+fprintf('\nStarting 3D animation...\n');
+
+fig1 = figure('Position', [50, 100, 1000, 700], 'Color', 'w', ...
+              'Name', sprintf('Subject %d - 3D Walking', sID));
+
+col_P = [0.85, 0.2, 0.2];
+col_N = [0.2, 0.4, 0.85];
+
+if save_video
+    v = VideoWriter(video_filename, 'MPEG-4');
+    v.FrameRate = 60;
+    open(v);
+end
+
+frame_skip = max(1, floor(n_total / 400));
+frames = 1:frame_skip:n_total;
+
+for idx = 1:length(frames)
+    i = frames(idx);
+    clf;
+    hold on;
+    
+    % Ground
+    fill3([0, walkway_length, walkway_length, 0], ...
+          [-0.6, -0.6, 0.6, 0.6], [0,0,0,0], ...
+          [0.92, 0.92, 0.88], 'EdgeColor', 'none', 'FaceAlpha', 0.8, 'HandleVisibility', 'off');
+    
+    for gx = 0:1:walkway_length
+        plot3([gx gx], [-0.6 0.6], [0 0], 'Color', [0.8 0.8 0.75], 'LineWidth', 0.5, 'HandleVisibility', 'off');
+    end
+    
+    % Trail
+    trail_start = max(1, i - trail_length * frame_skip);
+    trail_idx = trail_start:frame_skip:i;
+    
+    h_trail_P = [];
+    h_trail_N = [];
+    if length(trail_idx) > 1
+        h_trail_P = plot3(toe_P_pos(trail_idx,1), toe_P_pos(trail_idx,2), toe_P_pos(trail_idx,3), ...
+                          '-', 'Color', [col_P, 0.5], 'LineWidth', 2);
+        h_trail_N = plot3(toe_N_pos(trail_idx,1), toe_N_pos(trail_idx,2), toe_N_pos(trail_idx,3), ...
+                          '-', 'Color', [col_N, 0.5], 'LineWidth', 2);
+    end
+    
+    % Pelvis
+    h_pelvis = plot3([hip_P_pos(i,1), hip_N_pos(i,1)], ...
+                     [hip_P_pos(i,2), hip_N_pos(i,2)], ...
+                     [hip_P_pos(i,3), hip_N_pos(i,3)], 'Color', [0.3 0.3 0.3], 'LineWidth', 7);
+    
+    % Legs
+    h_leg_P = plot3([hip_P_pos(i,1), knee_P_pos(i,1), ankle_P_pos(i,1), toe_P_pos(i,1)], ...
+                    [hip_P_pos(i,2), knee_P_pos(i,2), ankle_P_pos(i,2), toe_P_pos(i,2)], ...
+                    [hip_P_pos(i,3), knee_P_pos(i,3), ankle_P_pos(i,3), toe_P_pos(i,3)], ...
+                    'Color', col_P, 'LineWidth', 5);
+    
+    h_leg_N = plot3([hip_N_pos(i,1), knee_N_pos(i,1), ankle_N_pos(i,1), toe_N_pos(i,1)], ...
+                    [hip_N_pos(i,2), knee_N_pos(i,2), ankle_N_pos(i,2), toe_N_pos(i,2)], ...
+                    [hip_N_pos(i,3), knee_N_pos(i,3), ankle_N_pos(i,3), toe_N_pos(i,3)], ...
+                    'Color', col_N, 'LineWidth', 5);
+    
+    % Joints
+    plot3([hip_P_pos(i,1), knee_P_pos(i,1), ankle_P_pos(i,1)], ...
+          [hip_P_pos(i,2), knee_P_pos(i,2), ankle_P_pos(i,2)], ...
+          [hip_P_pos(i,3), knee_P_pos(i,3), ankle_P_pos(i,3)], ...
+          'o', 'MarkerSize', 6, 'MarkerFaceColor', col_P, 'MarkerEdgeColor', 'k', 'HandleVisibility', 'off');
+    plot3([hip_N_pos(i,1), knee_N_pos(i,1), ankle_N_pos(i,1)], ...
+          [hip_N_pos(i,2), knee_N_pos(i,2), ankle_N_pos(i,2)], ...
+          [hip_N_pos(i,3), knee_N_pos(i,3), ankle_N_pos(i,3)], ...
+          'o', 'MarkerSize', 6, 'MarkerFaceColor', col_N, 'MarkerEdgeColor', 'k', 'HandleVisibility', 'off');
+    
+    % GRF
+    grf_scale = 0.001;
+    h_grf_P = [];
+    h_grf_N = [];
+    if GRF_P(i,3) > 50
+        h_grf_P = quiver3(toe_P_pos(i,1), toe_P_pos(i,2), 0, ...
+                0, 0, GRF_P(i,3)*grf_scale, ...
+                0, 'Color', [0.9 0.3 0.3], 'LineWidth', 3, 'MaxHeadSize', 0.5);
+    end
+    if GRF_N(i,3) > 50
+        h_grf_N = quiver3(toe_N_pos(i,1), toe_N_pos(i,2), 0, ...
+                0, 0, GRF_N(i,3)*grf_scale, ...
+                0, 'Color', [0.3 0.4 0.9], 'LineWidth', 3, 'MaxHeadSize', 0.5);
+    end
+    
+    % CoM
+    h_com = plot3(CoM_pos(i,1), CoM_pos(i,2), CoM_pos(i,3), 'o', ...
+                  'MarkerSize', 12, 'MarkerFaceColor', 'y', 'MarkerEdgeColor', 'k');
+    
+    axis equal;
+    xlim([0 walkway_length]);
+    ylim([-0.8 0.8]);
+    zlim([0 1.4]);
+    xlabel('X (m)'); ylabel('Y (m)'); zlabel('Z (m)');
+    
+    if stance_P(i) && stance_N(i)
+        phase_text = 'Double Support';
+    elseif stance_P(i)
+        phase_text = 'Single (Paretic)';
+    elseif stance_N(i)
+        phase_text = 'Single (Non-Paretic)';
+    else
+        phase_text = 'Flight';
+    end
+    
+    title(sprintf('Subject %d | %.1fkg, %.2fm | Time: %.1fs | %s', ...
+          sID, patient_mass, patient_height, t(i), phase_text), 'FontSize', 11, 'FontWeight', 'bold');
+    
+    grid on; box on;
+    rotate3d on;
+    view([-30, 20]);
+    
+    leg_h = [h_leg_P, h_leg_N, h_pelvis, h_com];
+    leg_l = {'Paretic (Red)', 'Non-Paretic (Blue)', 'Pelvis', 'CoM'};
+    if ~isempty(h_trail_P), leg_h = [h_trail_P, h_trail_N, leg_h]; leg_l = [{'Trail P', 'Trail N'}, leg_l]; end
+    if ~isempty(h_grf_P) && isvalid(h_grf_P), leg_h = [leg_h, h_grf_P]; leg_l = [leg_l, {'GRF P'}]; end
+    if ~isempty(h_grf_N) && isvalid(h_grf_N), leg_h = [leg_h, h_grf_N]; leg_l = [leg_l, {'GRF N'}]; end
+    legend(leg_h, leg_l, 'Location', 'eastoutside');
+    
+    drawnow;
+    if save_video, writeVideo(v, getframe(fig1)); end
+    pause(0.01);
+end
+
+if save_video, close(v); end
+rotate3d on;
+fprintf('Animation complete.\n');
+
+%% ======================= FIGURE 2: KINEMATICS ===========================
+fig2 = figure('Position', [100, 50, 1200, 800], 'Color', 'w', ...
+              'Name', sprintf('Subject %d - Kinematics', sID));
+
+n_show = min(2 * n_cycle, n_total);
+t_show = t(1:n_show);
+
+subplot(3,2,1);
+plot(t_show, toe_P_pos(1:n_show,1), 'r-', 'LineWidth', 1.5); hold on;
+plot(t_show, toe_N_pos(1:n_show,1), 'b-', 'LineWidth', 1.5);
+plot(t_show, CoM_pos(1:n_show,1), 'k--', 'LineWidth', 1.5);
+ylabel('X (m)'); title('Forward Position');
+legend('Paretic', 'Non-Paretic', 'CoM', 'Location', 'best'); grid on;
+
+subplot(3,2,3);
+plot(t_show, toe_P_pos(1:n_show,2), 'r-', 'LineWidth', 1.5); hold on;
+plot(t_show, toe_N_pos(1:n_show,2), 'b-', 'LineWidth', 1.5);
+ylabel('Y (m)'); title('Lateral Position');
+legend('Paretic', 'Non-Paretic', 'Location', 'best'); grid on;
+
+subplot(3,2,5);
+plot(t_show, toe_P_pos(1:n_show,3), 'r-', 'LineWidth', 1.5); hold on;
+plot(t_show, toe_N_pos(1:n_show,3), 'b-', 'LineWidth', 1.5);
+ylabel('Z (m)'); xlabel('Time (s)'); title('Toe Clearance');
+legend('Paretic', 'Non-Paretic', 'Location', 'best'); grid on;
+
+subplot(3,2,2);
+plot(t_show, hip_P_full(1:n_show), 'r-', 'LineWidth', 1.5); hold on;
+plot(t_show, hip_N_full(1:n_show), 'b-', 'LineWidth', 1.5);
+ylabel('Angle (°)'); title('Hip Flexion');
+legend('Paretic', 'Non-Paretic', 'Location', 'best'); grid on;
+
+subplot(3,2,4);
+plot(t_show, knee_P_full(1:n_show), 'r-', 'LineWidth', 1.5); hold on;
+plot(t_show, knee_N_full(1:n_show), 'b-', 'LineWidth', 1.5);
+ylabel('Angle (°)'); title('Knee Flexion');
+legend('Paretic', 'Non-Paretic', 'Location', 'best'); grid on;
+
+subplot(3,2,6);
+plot(t_show, ankle_P_full(1:n_show), 'r-', 'LineWidth', 1.5); hold on;
+plot(t_show, ankle_N_full(1:n_show), 'b-', 'LineWidth', 1.5);
+ylabel('Angle (°)'); xlabel('Time (s)'); title('Ankle Angle');
+legend('Paretic', 'Non-Paretic', 'Location', 'best'); grid on;
+
+sgtitle(sprintf('Subject %d (%.0fkg, %.2fm, Leg: %.0fmm) - Kinematics', ...
+        sID, patient_mass, patient_height, leg_length*1000), 'FontSize', 14, 'FontWeight', 'bold');
+
+%% ======================= FIGURE 3: GRF vs TIME ==========================
+fig3 = figure('Position', [150, 50, 1200, 700], 'Color', 'w', ...
+              'Name', sprintf('Subject %d - Ground Reaction Forces', sID));
+
+subplot(3,1,1);
+plot(t_show, GRF_P_BW(1:n_show,3), 'r-', 'LineWidth', 2); hold on;
+plot(t_show, GRF_N_BW(1:n_show,3), 'b-', 'LineWidth', 2);
+plot(t_show, GRF_P_BW(1:n_show,3) + GRF_N_BW(1:n_show,3), 'k--', 'LineWidth', 1.5);
+yline(1, ':', 'Color', [0.5 0.5 0.5], 'LineWidth', 1.5);
+ylabel('Force (BW)'); title('Vertical GRF (Fz)');
+legend('Paretic', 'Non-Paretic', 'Total', '1 BW', 'Location', 'best');
+ylim([0 1.6]); grid on;
+
+subplot(3,1,2);
+plot(t_show, GRF_P_BW(1:n_show,1), 'r-', 'LineWidth', 2); hold on;
+plot(t_show, GRF_N_BW(1:n_show,1), 'b-', 'LineWidth', 2);
+yline(0, ':', 'Color', [0.5 0.5 0.5]);
+ylabel('Force (BW)'); title('A-P GRF (Fx): Braking(-) / Propulsion(+)');
+legend('Paretic', 'Non-Paretic', 'Location', 'best');
+ylim([-0.3 0.3]); grid on;
+
+subplot(3,1,3);
+plot(t_show, GRF_P_BW(1:n_show,2), 'r-', 'LineWidth', 2); hold on;
+plot(t_show, GRF_N_BW(1:n_show,2), 'b-', 'LineWidth', 2);
+yline(0, ':', 'Color', [0.5 0.5 0.5]);
+ylabel('Force (BW)'); xlabel('Time (s)'); title('M-L GRF (Fy)');
+legend('Paretic', 'Non-Paretic', 'Location', 'best');
+ylim([-0.2 0.2]); grid on;
+
+sgtitle(sprintf('Subject %d - GRF (BW = %.1f N, Mass = %.1f kg)', sID, body_weight, patient_mass), ...
+        'FontSize', 14, 'FontWeight', 'bold');
+
+%% ======================= FIGURE 4: GRF vs GAIT CYCLE ====================
+fig4 = figure('Position', [200, 50, 1000, 500], 'Color', 'w', ...
+              'Name', sprintf('Subject %d - GRF vs Gait Cycle', sID));
+
+gait_pct = linspace(0, 100, n_cycle);
+
+n_avg = min(n_strides, 5);
+GRF_P_avg = zeros(n_cycle, 1);
+GRF_N_avg = zeros(n_cycle, 1);
+
+for c = 1:n_avg
+    idx1 = (c-1)*n_cycle + 1;
+    idx2 = c*n_cycle;
+    GRF_P_avg = GRF_P_avg + GRF_P_BW(idx1:idx2, 3);
+    GRF_N_avg = GRF_N_avg + GRF_N_BW(idx1:idx2, 3);
+end
+GRF_P_avg = GRF_P_avg / n_avg;
+GRF_N_avg = GRF_N_avg / n_avg;
+
+subplot(1,2,1);
+plot(gait_pct, GRF_P_avg, 'r-', 'LineWidth', 2.5); hold on;
+xline(60, '--k', 'LineWidth', 1.5);
+xlabel('Gait Cycle (%)'); ylabel('Vertical GRF (BW)');
+title('Paretic Leg');
+legend('GRF', 'Toe Off (60%)', 'Location', 'best');
+ylim([0 1.5]); xlim([0 100]); grid on;
+
+subplot(1,2,2);
+plot(gait_pct, GRF_N_avg, 'b-', 'LineWidth', 2.5); hold on;
+xline(60, '--k', 'LineWidth', 1.5);
+xlabel('Gait Cycle (%)'); ylabel('Vertical GRF (BW)');
+title('Non-Paretic Leg');
+legend('GRF', 'Toe Off (60%)', 'Location', 'best');
+ylim([0 1.5]); xlim([0 100]); grid on;
+
+sgtitle(sprintf('Subject %d - Average GRF Pattern', sID), 'FontSize', 14, 'FontWeight', 'bold');
+
+%% ======================= SUMMARY ========================================
+fprintf('\n================ SUBJECT SUMMARY ================\n');
+fprintf('Subject ID:     %d\n', sID);
+fprintf('Age:            %d years\n', patient_age);
+fprintf('Sex:            %s\n', ternary(is_male==1, 'Male', 'Female'));
+fprintf('Height:         %.2f m (%.0f mm)\n', patient_height, patient_height*1000);
+fprintf('Weight:         %.1f kg\n', patient_mass);
+fprintf('Leg Length:     %.3f m (%.0f mm)\n', leg_length, leg_length*1000);
+fprintf('Body Weight:    %.1f N\n', body_weight);
+fprintf('\n');
+fprintf('Lesion Side:    %s hemisphere\n', ternary(lesion_left==1, 'Left', 'Right'));
+fprintf('FAC:            %d\n', FAC);
+fprintf('POMA:           %d\n', POMA);
+fprintf('TPS:            %d\n', TPS);
+fprintf('\n');
+fprintf('Stride Length:  %.3f m\n', stride_length);
+fprintf('Walking Speed:  %.2f m/s\n', walking_speed);
+fprintf('Asymmetry:      %.1f%%\n', asymmetry);
+fprintf('\n');
+fprintf('Peak Vertical GRF:\n');
+fprintf('  Paretic:      %.2f BW (%.1f N)\n', max(GRF_P_BW(:,3)), max(GRF_P(:,3)));
+fprintf('  Non-Paretic:  %.2f BW (%.1f N)\n', max(GRF_N_BW(:,3)), max(GRF_N(:,3)));
+fprintf('=================================================\n');
+
+% Helper function for conditional text
+function out = ternary(cond, true_val, false_val)
+    if cond
+        out = true_val;
+    else
+        out = false_val;
+    end
+end
+
+
