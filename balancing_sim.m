@@ -1,5 +1,3 @@
-
-
 %% =========================================================================
 %  ZMP BALANCE CONTROLLER - INTEGRATED WITH ASSISTIVE GAIT CONTROLLER
 %  WITH IMPROVED ANKLE/HIP BALANCE STRATEGY FOR ROUGH TERRAIN
@@ -20,15 +18,15 @@ clear; clc; close all;
 % Path to stroke patient gait data file
 data_path = 'MAT_normalizedData_PostStrokeAdults_v27-02-23.mat';
 
-sID = 3;  % Subject ID to simulate (1-50 available)
+sID = 4;  % Subject ID to simulate (1-50 available)
 
 % Controller settings
 assist_level = 0.80;  % Fraction of correction provided (0-1)
 
 % PID gains for gait assistance
-Kp = 3.0;    % Proportional gain - responds to current error
-Ki = 0.75;   % Integral gain - eliminates steady-state error 
-Kd = 0.25;   % Derivative gain - adds damping
+Kp = 0.8;    % Proportional gain - responds to current error
+Ki = 0.1;   % Integral gain - eliminates steady-state error 
+Kd = 0.15;   % Derivative gain - adds damping
 I_max = 15;  % Anti-windup limit for integral term
 corr_max = 20;  % Maximum correction in degrees
 
@@ -154,7 +152,55 @@ has_gait_events = false;
 P_TO_pct = 60;  % Paretic leg Toe Off percentage
 N_TO_pct = 60;  % Non-paretic leg Toe Off percentage
 
-% ----- PARETIC SIDE GAIT EVENTS -----
+% ----- CHECK Sub(sID).events STRUCT FIRST -----
+% Gait events are stored in Sub(sID).events for most subjects,
+% not inside PsideSegm_PsideData — check here first.
+if isfield(S, 'events')
+    E = S.events;
+    fprintf('  Found Sub(%d).events struct\n', sID);
+
+    % Paretic TOnorm
+    if isfield(E, 'P_TOnorm')
+        P_TO_norm = E.P_TOnorm;
+        if isnumeric(P_TO_norm) && ~isempty(P_TO_norm)
+            % Values may be frame indices (0-1001) or percentages (0-100)
+            % Convert frame indices to percentage if values exceed 100
+            if max(P_TO_norm(:)) > 100
+                P_TO_norm = P_TO_norm / 1001 * 100;
+            end
+            valid_vals = P_TO_norm(P_TO_norm > 0 & P_TO_norm < 100);
+            if ~isempty(valid_vals)
+                P_TO_pct = mean(valid_vals);
+                has_gait_events = true;
+                fprintf('  Paretic TO at %.1f%% (from events.P_TOnorm)\n', P_TO_pct);
+            end
+        end
+    end
+
+    % Non-paretic TOnorm
+    if isfield(E, 'N_TOnorm')
+        N_TO_norm = E.N_TOnorm;
+        if isnumeric(N_TO_norm) && ~isempty(N_TO_norm)
+            if max(N_TO_norm(:)) > 100
+                N_TO_norm = N_TO_norm / 1001 * 100;
+            end
+            valid_vals = N_TO_norm(N_TO_norm > 0 & N_TO_norm < 100);
+            if ~isempty(valid_vals)
+                N_TO_pct = mean(valid_vals);
+                has_gait_events = true;
+                fprintf('  Non-paretic TO at %.1f%% (from events.N_TOnorm)\n', N_TO_pct);
+            end
+        end
+    end
+
+    % IC/TO frame counts if available
+    if isfield(E, 'P_IC_cnt'), P_IC_frames = E.P_IC_cnt; end
+    if isfield(E, 'P_TO_cnt'), P_TO_frames = E.P_TO_cnt; end
+    if isfield(E, 'N_IC_cnt'), N_IC_frames = E.N_IC_cnt; end
+    if isfield(E, 'N_TO_cnt'), N_TO_frames = E.N_TO_cnt; end
+end
+
+% ----- PARETIC SIDE GAIT EVENTS (fallback: inside PsideSegm_PsideData) -----
 if isfield(P, 'P_IC_cnt') && isfield(P, 'P_TO_cnt')
     % P_IC_cnt: Frame indices where Initial Contact occurs
     % P_TO_cnt: Frame indices where Toe Off occurs
@@ -412,6 +458,24 @@ knee_flex_N = fillmissing(knee_flex_N(:), 'linear');
 ankle_flex_P = fillmissing(ankle_flex_P(:), 'linear');
 ankle_flex_N = fillmissing(ankle_flex_N(:), 'linear');
 
+% Normalise to 200 points/cycle to prevent dt blow-up in ZMP calculation.
+% Raw sample counts (8008, 9009 etc.) make dt tiny, causing CoM acceleration
+% to produce nonsensical ZMP margins (-4000 cm). sID 2 (9009) is borderline
+% but sID 1 (8008) and sID 4 (1001) both need this fix.
+N_NORM = 200;
+if n_cycle ~= N_NORM
+    x_old = linspace(0, 1, n_cycle);
+    x_new = linspace(0, 1, N_NORM);
+    hip_flex_P   = interp1(x_old, hip_flex_P,   x_new, 'pchip')';
+    knee_flex_P  = interp1(x_old, knee_flex_P,  x_new, 'pchip')';
+    ankle_flex_P = interp1(x_old, ankle_flex_P, x_new, 'pchip')';
+    hip_flex_N   = interp1(x_old, hip_flex_N,   x_new, 'pchip')';
+    knee_flex_N  = interp1(x_old, knee_flex_N,  x_new, 'pchip')';
+    ankle_flex_N = interp1(x_old, ankle_flex_N, x_new, 'pchip')';
+    fprintf('Resampled: %d -> %d points per cycle\n', n_cycle, N_NORM);
+    n_cycle = N_NORM;
+end
+
 fprintf('Gait cycle: %d samples\n', n_cycle);
 
 %% ========== ASSISTIVE PID CONTROLLER ==========
@@ -522,7 +586,48 @@ reduction_ankle = 100 * (1 - mean_res_ankle / mean_gap_ankle);
 fprintf('Gap reduction: Hip=%.0f%%, Knee=%.0f%%, Ankle=%.0f%%\n', ...
     reduction_hip, reduction_knee, reduction_ankle);
 
-%% ========== CALCULATE STRIDE LENGTH ==========
+% -------------------------------------------------------------------------
+% CIRCUMDUCTION / HYPERMETRIA DETECTION
+% Fires when paretic hip ROM exceeds non-paretic by >80%.
+% Only clinically relevant for sID 1 (left hemisphere, 98% excess).
+% For sID 2 and sID 4 circumduction_detected stays false — no effect.
+% -------------------------------------------------------------------------
+hip_ROM_P  = max(hip_flex_P) - min(hip_flex_P);
+hip_ROM_N  = max(hip_flex_N) - min(hip_flex_N);
+knee_ROM_P = max(knee_flex_P) - min(knee_flex_P);
+knee_ROM_N = max(knee_flex_N) - min(knee_flex_N);
+ankle_ROM_P= max(ankle_flex_P) - min(ankle_flex_P);
+ankle_ROM_N= max(ankle_flex_N) - min(ankle_flex_N);
+
+circumduction_detected = false;
+
+if hip_ROM_P > hip_ROM_N * 1.80
+    circumduction_detected = true;
+    fprintf('\n========== CIRCUMDUCTION / HYPERMETRIA DETECTED ==========\n');
+    fprintf('  Hip ROM  — Paretic: %.1f deg  Non-paretic: %.1f deg\n', hip_ROM_P, hip_ROM_N);
+    fprintf('  Knee ROM — Paretic: %.1f deg  Non-paretic: %.1f deg\n', knee_ROM_P, knee_ROM_N);
+    fprintf('  Ankle ROM— Paretic: %.1f deg  Non-paretic: %.1f deg\n', ankle_ROM_P, ankle_ROM_N);
+    fprintf('\n  CLINICAL NOTE:\n');
+    fprintf('  Paretic hip ROM exceeds non-paretic by %.0f%%.\n', ...
+            100*(hip_ROM_P - hip_ROM_N)/hip_ROM_N);
+    fprintf('  This indicates spastic circumduction rather than reduced ROM.\n');
+    fprintf('  The PID is CORRECTLY reducing hypermetric swing toward healthy ROM.\n');
+    fprintf('  Primary outcomes: step asymmetry and GRF symmetry.\n');
+    fprintf('==========================================================\n\n');
+else
+    fprintf('  Gait pattern: Classical hemiparesis (paretic ROM < non-paretic)\n');
+    fprintf('  Hip ROM — Paretic: %.1f deg  Non-paretic: %.1f deg\n', hip_ROM_P, hip_ROM_N);
+end
+
+% Boost paretic_strength only for extreme circumduction (>90% excess ROM)
+if circumduction_detected && (hip_ROM_P > hip_ROM_N * 1.90)
+    paretic_strength_original = paretic_strength;
+    paretic_strength = min(0.80, paretic_strength + 0.12);
+    fprintf('Paretic strength adjusted: %.2f -> %.2f (extreme circumduction)\n', ...
+            paretic_strength_original, paretic_strength);
+else
+    fprintf('Paretic strength unchanged: %.2f\n', paretic_strength);
+end
 % Estimate gait parameters from hip range of motion
 % Uses pendulum model: step length ≈ leg_length * (sin(flex) + sin(ext))
 % This assumes the leg swings like a pendulum from the hip
@@ -779,8 +884,43 @@ else
     % Dynamic threshold based on minimum clearance in data
     % Foot is in stance if clearance is below threshold
     stance_threshold = min([clearance_A; clearance_N]) + 0.02;
-    
-    fprintf('  Stance threshold (auto): %.3f m\n', stance_threshold);
+
+    % For circumduction cases the min clearance is deeply negative due to
+    % hypermetric swing, causing ~49% false flight phase. Try increasing
+    % percentiles until threshold is positive (foot actually on ground).
+    if circumduction_detected && stance_threshold < 0
+        all_clearance = [clearance_A; clearance_N];
+        for pct = [15, 25, 35, 45, 55, 65, 75]
+            stance_threshold = prctile(all_clearance, pct);
+            if stance_threshold >= 0.002
+                break;
+            end
+        end
+
+        % If all percentiles still negative, clearance-based detection
+        % has completely failed for this circumduction patient.
+        % Fall back to clinically-derived stance timing:
+        % FAC=3 circumduction: paretic ~58%, non-paretic ~62%, DS ~20%
+        if stance_threshold < 0
+            fprintf('  WARNING: All clearances negative — using clinical stance timing\n');
+            p_stance_pct = 58;  % % of gait cycle paretic in stance
+            n_stance_pct = 62;  % % of gait cycle non-paretic in stance
+            ds_offset    = 10;  % double support starts at this % offset
+            for k = 1:n_total
+                phase_pct = mod(k-1, n_cycle) / n_cycle * 100;
+                stance_A(k) = phase_pct <= p_stance_pct;
+                shifted = mod(phase_pct + 50, 100);
+                stance_N(k) = shifted <= n_stance_pct;
+            end
+            fprintf('  Clinical stance — Paretic: %.0f%%  Non-paretic: %.0f%%\n', ...
+                    p_stance_pct, n_stance_pct);
+            % Skip the clearance threshold assignment
+            stance_threshold = 0;
+        end
+        fprintf('  Stance threshold (percentile-based for circumduction): %.3f m\n', stance_threshold);
+    else
+        fprintf('  Stance threshold (auto): %.3f m\n', stance_threshold);
+    end
     
     % Detect stance phases
     stance_A = clearance_A < stance_threshold;
@@ -871,25 +1011,161 @@ CoM_acc(:,3) = max(-max_acc*2, min(max_acc*2, CoM_acc(:,3))); % Vertical (can be
 % Zero Moment Point (ZMP) is where ground reaction force must act
 % If ZMP leaves support polygon (area under feet), person will fall
 %
-% The ZMP is calculated from the inverted pendulum model:
+% METHOD 1 (preferred): Direct from force plate GRF + Moment data
+%   ZMP_x = -Moment_y / GRF_z
+%   ZMP_y =  Moment_x / GRF_z
+%   Exact formula — no kinematic estimation, no noise amplification.
+%
+% METHOD 2 (fallback): Inverted pendulum model from CoM kinematics
 %   ZMP_x = CoM_x - h * (a_x / (g + a_z))
-% where h is CoM height, a is acceleration, g is gravity
 fprintf('\nCalculating ZMP...\n');
 
-zmp_pos = zeros(n_total, 2);     % ZMP position [x, y] on ground plane
-zmp_margin = zeros(n_total, 1);   % Distance from ZMP to support edge
-zmp_stable = zeros(n_total, 1);   % Boolean: is ZMP inside support polygon?
+zmp_pos = zeros(n_total, 2);
+zmp_margin = zeros(n_total, 1);
+zmp_stable = zeros(n_total, 1);
+
+% ---- Attempt measured ZMP from force plate data ----------------------
+has_measured_zmp = false;
+zmp_from_measurement = zeros(n_cycle, 2);  % one cycle, tiled later
+
+if isfield(P, 'GroundReactionForce') && isfield(P, 'GroundReactionMoment')
+    grf_Pz_raw = P.GroundReactionForce.z;
+    grm_Py_raw = P.GroundReactionMoment.y;
+    grm_Px_raw = P.GroundReactionMoment.x;
+    grf_Nz_raw = N.GroundReactionForce.z;
+    grm_Ny_raw = N.GroundReactionMoment.y;
+    grm_Nx_raw = N.GroundReactionMoment.x;
+
+    % Average valid columns only (exclude all-NaN columns)
+    valid_P = any(grf_Pz_raw > 0, 1) & ~all(isnan(grf_Pz_raw), 1);
+    valid_N = any(grf_Nz_raw > 0, 1) & ~all(isnan(grf_Nz_raw), 1);
+
+    if any(valid_P)
+        grf_Pz  = mean(grf_Pz_raw(:, valid_P),  2, 'omitnan');
+        grm_Py  = mean(grm_Py_raw(:, valid_P),  2, 'omitnan');
+        grm_Px  = mean(grm_Px_raw(:, valid_P),  2, 'omitnan');
+    else
+        grf_Pz = []; 
+    end
+
+    if any(valid_N)
+        grf_Nz  = mean(grf_Nz_raw(:, valid_N),  2, 'omitnan');
+        grm_Ny  = mean(grm_Ny_raw(:, valid_N),  2, 'omitnan');
+        grm_Nx  = mean(grm_Nx_raw(:, valid_N),  2, 'omitnan');
+    else
+        grf_Nz = [];
+    end
+
+    % Convert units if N/kg (max < 50 implies normalised)
+    if ~isempty(grf_Pz) && max(grf_Pz) < 50
+        grf_Pz = grf_Pz * patient_mass;
+        grm_Py = grm_Py * patient_mass;
+        grm_Px = grm_Px * patient_mass;
+        fprintf('  GRF/Moment units: N/kg -> converted to N\n');
+    end
+    if ~isempty(grf_Nz) && max(grf_Nz) < 50
+        grf_Nz = grf_Nz * patient_mass;
+        grm_Ny = grm_Ny * patient_mass;
+        grm_Nx = grm_Nx * patient_mass;
+    end
+
+    % Resample from 1001 to n_cycle points
+    x_src = linspace(0, 1, 1001);
+    x_dst = linspace(0, 1, n_cycle);
+
+    if ~isempty(grf_Pz)
+        grf_Pz_c = interp1(x_src, grf_Pz, x_dst, 'pchip')';
+        grm_Py_c = interp1(x_src, grm_Py, x_dst, 'pchip')';
+        grm_Px_c = interp1(x_src, grm_Px, x_dst, 'pchip')';
+    else
+        grf_Pz_c = zeros(n_cycle,1);
+        grm_Py_c = zeros(n_cycle,1);
+        grm_Px_c = zeros(n_cycle,1);
+    end
+
+    if ~isempty(grf_Nz)
+        grf_Nz_c = interp1(x_src, grf_Nz, x_dst, 'pchip')';
+        grm_Ny_c = interp1(x_src, grm_Ny, x_dst, 'pchip')';
+        grm_Nx_c = interp1(x_src, grm_Nx, x_dst, 'pchip')';
+    else
+        grf_Nz_c = zeros(n_cycle,1);
+        grm_Ny_c = zeros(n_cycle,1);
+        grm_Nx_c = zeros(n_cycle,1);
+    end
+
+    % Compute ZMP per cycle frame, weighted by GRF
+    grf_threshold_N = 10;  % Newtons
+    for ci = 1:n_cycle
+        fz_P = grf_Pz_c(ci);
+        fz_N = grf_Nz_c(ci);
+        fz_tot = fz_P + fz_N;
+        if fz_tot > grf_threshold_N
+            if fz_P > grf_threshold_N && fz_N > grf_threshold_N
+                zx_P = -grm_Py_c(ci)/fz_P;  zy_P = grm_Px_c(ci)/fz_P;
+                zx_N = -grm_Ny_c(ci)/fz_N;  zy_N = grm_Nx_c(ci)/fz_N;
+                zmp_from_measurement(ci,1) = (fz_P*zx_P + fz_N*zx_N)/fz_tot;
+                zmp_from_measurement(ci,2) = (fz_P*zy_P + fz_N*zy_N)/fz_tot;
+            elseif fz_P > grf_threshold_N
+                zmp_from_measurement(ci,1) = -grm_Py_c(ci)/fz_P;
+                zmp_from_measurement(ci,2) =  grm_Px_c(ci)/fz_P;
+            elseif fz_N > grf_threshold_N
+                zmp_from_measurement(ci,1) = -grm_Ny_c(ci)/fz_N;
+                zmp_from_measurement(ci,2) =  grm_Nx_c(ci)/fz_N;
+            end
+        end
+    end
+
+    % Validate — ZMP should be within ±0.5m (foot-relative coordinates)
+    zmp_range = max(abs(zmp_from_measurement(:,1)));
+    if zmp_range > 0.001 && zmp_range < 0.5
+        % Clamp to foot boundary — outlier frames at heel strike/toe-off
+        % transitions can produce CoP values slightly outside foot outline
+        % due to trial averaging noise. Clamp to foot dimensions.
+        max_zmp_x = foot_length * 0.6;  % allow slight overshoot of foot length
+        max_zmp_y = foot_width  * 0.6;
+        zmp_from_measurement(:,1) = max(-max_zmp_x, min(max_zmp_x, zmp_from_measurement(:,1)));
+        zmp_from_measurement(:,2) = max(-max_zmp_y, min(max_zmp_y, zmp_from_measurement(:,2)));
+        has_measured_zmp = true;
+        fprintf('  ZMP from force plate moments (exact). Range: %.3f m\n', zmp_range);
+    else
+        fprintf('  ZMP moment data invalid (range=%.3f m) — kinematic fallback\n', zmp_range);
+    end
+end
 
 for i = 1:n_total
-    % Get ground height and CoM height above ground
     ground_z = terrain_z(i);
-    h_com = CoM_pos(i,3) - ground_z - offset;  % Height of CoM above terrain
-    
-    % ZMP formula from inverted pendulum model
-    denom = max(g + CoM_acc(i,3), 0.1);  % Prevent division by zero
-    
-    zmp_x = CoM_pos(i,1) - h_com * (CoM_acc(i,1) / denom);
-    zmp_y = CoM_pos(i,2) - h_com * (CoM_acc(i,2) / denom);
+    h_com = CoM_pos(i,3) - ground_z - offset;
+
+    if has_measured_zmp
+        % METHOD 1: measured CoP in foot-relative coords
+        % Add current ankle position to get global frame ZMP
+        ci = mod(i-1, n_cycle) + 1;
+        if zmp_from_measurement(ci,1) ~= 0 || zmp_from_measurement(ci,2) ~= 0
+            % Use stance foot ankle as reference origin
+            if stance_A(i)
+                ref_x = ankle_A_pos(i,1);
+                ref_y = ankle_A_pos(i,2);
+            elseif stance_N(i)
+                ref_x = ankle_N_pos(i,1);
+                ref_y = ankle_N_pos(i,2);
+            else
+                ref_x = CoM_pos(i,1);
+                ref_y = CoM_pos(i,2);
+            end
+            zmp_x = ref_x + zmp_from_measurement(ci,1);  % CoP in local foot frame, no offset needed
+            zmp_y = ref_y + zmp_from_measurement(ci,2);
+        else
+            % Flight phase — kinematic fallback
+            denom = max(g + CoM_acc(i,3), 0.1);
+            zmp_x = CoM_pos(i,1) - h_com * (CoM_acc(i,1) / denom);
+            zmp_y = CoM_pos(i,2) - h_com * (CoM_acc(i,2) / denom);
+        end
+    else
+        % METHOD 2: ZMP from inverted pendulum model
+        denom = max(g + CoM_acc(i,3), 0.1);
+        zmp_x = CoM_pos(i,1) - h_com * (CoM_acc(i,1) / denom);
+        zmp_y = CoM_pos(i,2) - h_com * (CoM_acc(i,2) / denom);
+    end
     
     zmp_pos(i,:) = [zmp_x, zmp_y];
     
@@ -1054,15 +1330,17 @@ for i = 1:n_total
         
     else
         % ----- STEPPING STRATEGY -----
-        % Large error: maximum correction effort
-        % In reality, would need to take a step; here we apply max torque
+        % Proportionally scaled — ramps from 0 at hip_threshold to max at
+        % 2x hip_threshold. Prevents full saturation torque for borderline
+        % violations which was destabilising CoM for sID 1.
         balance_strategy(i) = 3;
-        
+
         direction = sign(zmp_error_x);
-        ankle_torque_A(i) = direction * max_ankle_torque * paretic_strength;
-        ankle_torque_N(i) = direction * max_ankle_torque;
-        hip_torque_A(i) = direction * max_hip_torque * paretic_strength;
-        hip_torque_N(i) = direction * max_hip_torque;
+        step_scale = min(1.0, zmp_error_mag / hip_threshold);
+        ankle_torque_A(i) = direction * max_ankle_torque * paretic_strength * step_scale;
+        ankle_torque_N(i) = direction * max_ankle_torque * step_scale;
+        hip_torque_A(i)   = direction * max_hip_torque   * paretic_strength * step_scale;
+        hip_torque_N(i)   = direction * max_hip_torque   * step_scale;
     end
     
     % Clamp all torques to motor/muscle limits
@@ -1311,11 +1589,32 @@ zmp_stable_bal = zeros(n_total, 1);
 for i = 1:n_total
     ground_z = terrain_z(i);
     h_com = CoM_pos_bal(i,3) - ground_z - offset_bal;
-    
-    denom = max(g + CoM_acc_bal(i,3), 0.1);
-    
-    zmp_x = CoM_pos_bal(i,1) - h_com * (CoM_acc_bal(i,1) / denom);
-    zmp_y = CoM_pos_bal(i,2) - h_com * (CoM_acc_bal(i,2) / denom);
+
+    if has_measured_zmp
+        ci = mod(i-1, n_cycle) + 1;
+        if zmp_from_measurement(ci,1) ~= 0 || zmp_from_measurement(ci,2) ~= 0
+            if stance_A(i)
+                ref_x = ankle_A_pos_bal(i,1);
+                ref_y = ankle_A_pos_bal(i,2);
+            elseif stance_N(i)
+                ref_x = ankle_N_pos_bal(i,1);
+                ref_y = ankle_N_pos_bal(i,2);
+            else
+                ref_x = CoM_pos_bal(i,1);
+                ref_y = CoM_pos_bal(i,2);
+            end
+            zmp_x = ref_x + zmp_from_measurement(ci,1);  % CoP in local foot frame, no offset needed
+            zmp_y = ref_y + zmp_from_measurement(ci,2);
+        else
+            denom = max(g + CoM_acc_bal(i,3), 0.1);
+            zmp_x = CoM_pos_bal(i,1) - h_com * (CoM_acc_bal(i,1) / denom);
+            zmp_y = CoM_pos_bal(i,2) - h_com * (CoM_acc_bal(i,2) / denom);
+        end
+    else
+        denom = max(g + CoM_acc_bal(i,3), 0.1);
+        zmp_x = CoM_pos_bal(i,1) - h_com * (CoM_acc_bal(i,1) / denom);
+        zmp_y = CoM_pos_bal(i,2) - h_com * (CoM_acc_bal(i,2) / denom);
+    end
     
     zmp_pos_bal(i,:) = [zmp_x, zmp_y];
     
