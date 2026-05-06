@@ -10,7 +10,7 @@ This project implements a three-module control algorithm for adaptive gait rehab
 - **Module 2 — ZMP Stability Supervisor**: Monitors the Zero Moment Point in real time and triggers hierarchical balance strategies (ankle → hip → stepping) when postural instability is detected.
 - **Module 3 — Adaptive PID Assistive Controller**: Uses contralateral limb mirroring with an Assist-as-Needed gain schedule to minimise the kinematic gap between paretic and non-paretic limbs.
 
-The system was validated on a clinical dataset of 50 stroke survivors across five terrain profiles (Flat, Slope, Rough, Sine, Step).
+The system was validated on a clinical dataset of using 4 of the 50 stroke survivors across five terrain profiles (Flat, Slope, Rough, Sine, Step).
 
 ## Requirements
 
