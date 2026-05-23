@@ -1,5 +1,6 @@
 # Adaptive CPG-ZMP Exoskeleton Controller
 
+
 A multi-disciplinary control framework for a Lower-Limb Robotic Exoskeleton (LLRE), integrating Central Pattern Generators (CPG) and Zero Moment Point (ZMP) stability for uneven terrain locomotion in post-stroke rehabilitation.
 
 ## Overview
