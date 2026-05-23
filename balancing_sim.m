@@ -9,6 +9,7 @@
 %    3. ZMP analysis - monitors stability margin throughout gait
 %    4. Terrain adaptation - auto-tunes gains based on terrain difficulty
 %  
+%
 %  Color convention: RED = Paretic (assisted), BLUE = Non-Paretic (healthy)
 % =========================================================================
 
